@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel in-progress runs when a new commit lands on the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-typecheck-test:
+    name: Lint · Typecheck · Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run type-check
+
+      - name: Unit tests
+        run: npm run test
+        env:
+          # Test env — placeholders. Tests must not require real Firebase.
+          NEXT_PUBLIC_FIREBASE_API_KEY: AIzaTestKeyForCIBuildOnly1234567890123
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: test.firebaseapp.com
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: test
+          NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: test.appspot.com
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: '123456789'
+          NEXT_PUBLIC_FIREBASE_APP_ID: '1:123456789:web:abcdef'
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
+          NEXT_PUBLIC_SUPPORT_PHONE: '+213233000000'
+          FIREBASE_ADMIN_PROJECT_ID: test
+          FIREBASE_ADMIN_CLIENT_EMAIL: ci@test.iam.gserviceaccount.com
+          FIREBASE_ADMIN_PRIVATE_KEY: |
+            "-----BEGIN PRIVATE KEY-----\nMIIBPLACEHOLDER1234567890123456789012345678901234567890123456789012345678901234567890\n-----END PRIVATE KEY-----"
+          NEXTAUTH_SECRET: ci_test_secret_at_least_32_chars_long_xx
+          NODE_ENV: test
+
+  build:
+    name: Build
+    needs: lint-typecheck-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_PUBLIC_FIREBASE_API_KEY: AIzaTestKeyForCIBuildOnly1234567890123
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: test.firebaseapp.com
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: test
+          NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: test.appspot.com
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: '123456789'
+          NEXT_PUBLIC_FIREBASE_APP_ID: '1:123456789:web:abcdef'
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
+          NEXT_PUBLIC_SUPPORT_PHONE: '+213233000000'
+          FIREBASE_ADMIN_PROJECT_ID: test
+          FIREBASE_ADMIN_CLIENT_EMAIL: ci@test.iam.gserviceaccount.com
+          FIREBASE_ADMIN_PRIVATE_KEY: |
+            "-----BEGIN PRIVATE KEY-----\nMIIBPLACEHOLDER1234567890123456789012345678901234567890123456789012345678901234567890\n-----END PRIVATE KEY-----"
+          NEXTAUTH_SECRET: ci_test_secret_at_least_32_chars_long_xx
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history for scanners that diff
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Don't fail the whole pipeline on report-only findings; gitleaks
+        # exits non-zero only when actual leaks are detected.
+        continue-on-error: false
+
+  # E2E tests run against Playwright. They need a built app running, so
+  # split into a separate job that only runs on PRs to main + nightly.
+  e2e:
+    name: E2E (Playwright)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Build app
+        run: npm run build
+        env:
+          NEXT_PUBLIC_FIREBASE_API_KEY: AIzaTestKeyForCIBuildOnly1234567890123
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: test.firebaseapp.com
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: test
+          NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: test.appspot.com
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: '123456789'
+          NEXT_PUBLIC_FIREBASE_APP_ID: '1:123456789:web:abcdef'
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
+          NEXT_PUBLIC_SUPPORT_PHONE: '+213233000000'
+          FIREBASE_ADMIN_PROJECT_ID: test
+          FIREBASE_ADMIN_CLIENT_EMAIL: ci@test.iam.gserviceaccount.com
+          FIREBASE_ADMIN_PRIVATE_KEY: |
+            "-----BEGIN PRIVATE KEY-----\nMIIBPLACEHOLDER1234567890123456789012345678901234567890123456789012345678901234567890\n-----END PRIVATE KEY-----"
+          NEXTAUTH_SECRET: ci_test_secret_at_least_32_chars_long_xx
+
+      - name: Run Playwright
+        run: npm run test:e2e
+        env:
+          BASE_URL: http://localhost:3000
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

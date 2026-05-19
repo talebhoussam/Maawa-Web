@@ -1,0 +1,120 @@
+rules_version = '2';
+
+/**
+ * Maawa Storage rules.
+ *
+ * Same threat model as firestore.rules — browser hostile, server admin.
+ *
+ * Naming: "isOwner" matches user-uid-prefixed path segment.
+ *         "isAdmin" matches the `admin` custom claim.
+ */
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isAdmin()    { return isSignedIn() && request.auth.token.admin == true; }
+    function isImage()    { return request.resource.contentType.matches('image/(jpeg|png|webp|heic|heif)'); }
+    function isVideo()    { return request.resource.contentType.matches('video/(mp4|quicktime|webm)'); }
+
+    // ─── Profile avatars — 2 MB, image only ─────────────────────────
+    match /users/{userId}/avatar.jpg {
+      allow read:  if isSignedIn();
+      allow write: if isOwner(userId)
+        && request.resource.size < 2 * 1024 * 1024
+        && isImage();
+    }
+
+    // ─── Artisan portfolio images — 5 MB, image only ────────────────
+    match /portfolio/{userId}/{fileName} {
+      allow read:   if isSignedIn();
+      allow write:  if isOwner(userId)
+        && request.resource.size < 5 * 1024 * 1024
+        && isImage();
+      allow delete: if isOwner(userId);
+    }
+
+    // ─── Reels videos — 50 MB, video only ──────────────────────────
+    // ─── Reels — videos OR poster thumbnails, public read ───────────
+    // Reels are public-by-design (matches the future public-feed read
+    // path on /feed_posts). Two upload kinds:
+    //   - video/* up to 50 MB  (the reel itself)
+    //   - image/* up to 5 MB   (poster / cover thumbnail)
+    // Both go under /reels/{userId}/{fileName}; the route writing the
+    // feed_posts doc captures their paths separately.
+    match /reels/{userId}/{fileName} {
+      allow read:   if true;
+      allow write:  if isOwner(userId)
+        && (
+          (isVideo() && request.resource.size < 50 * 1024 * 1024)
+          || (isImage() && request.resource.size < 5 * 1024 * 1024)
+        );
+      allow delete: if isOwner(userId);
+    }
+
+    // ─── Chat attachments — 10 MB, any type but checked by chat membership ──
+    // We can't easily verify chat membership here without a Firestore
+    // get-cross-service call (Storage rules can't read Firestore). So we
+    // restrict to a single sender's folder under each chat: only the
+    // authenticated user can write to {chatId}/{senderUid}/. Reads are
+    // open to any authed user (sufficient given chats themselves are
+    // gated server-side via signed URLs in production).
+    match /chats/{chatId}/{senderUid}/{fileName} {
+      allow read:  if isSignedIn();
+      allow write: if isOwner(senderUid)
+        && request.resource.size < 10 * 1024 * 1024;
+    }
+
+    // ─── NIN identity documents — write-only for owner, admin reads ─
+    // Critical: end-users must NEVER be able to read a NIN doc, even
+    // their own — to prevent any UI from exposing the URL or anyone
+    // who hijacked the session from downloading it.
+    // Admins (with the `admin` custom claim) can read for review.
+    match /applications/{userId}/{fileName} {
+      allow read:  if isAdmin();
+      allow write: if isOwner(userId)
+        && request.resource.size < 5 * 1024 * 1024
+        && isImage();
+    }
+
+    // ─── Mission photos — 10 MB, image only ─────────────────────────
+    // Both client and artisan upload before/after photos.
+    // We don't know membership here without a Firestore lookup, so we
+    // accept any signed-in user; in production the page issues signed
+    // URLs from the server to enforce participant scope.
+    match /missions/{missionId}/{fileName} {
+      allow read:  if isSignedIn();
+      allow write: if isSignedIn()
+        && request.resource.size < 10 * 1024 * 1024
+        && isImage();
+    }
+
+    // ─── Coin-purchase proof images ─────────────────────────────────
+    // Users upload an optional screenshot of their CCP/Baridimob slip
+    // when requesting a coin recharge. Only the uploader can read their
+    // own proofs; admins can read any (for review). 5 MB image cap.
+    match /coin_proofs/{userId}/{fileName} {
+      allow read:  if isAdmin() || isOwner(userId);
+      allow write: if isOwner(userId)
+        && request.resource.size < 5 * 1024 * 1024
+        && isImage();
+    }
+
+    // ─── Stories — 24h ephemeral, public read by design ─────────────
+    // Stories are a public-by-design feature: guests can view them
+    // (matches firestore.rules /stories read:true). Only the owner
+    // can upload, capped at 10 MB image only.
+    match /stories/{userId}/{fileName} {
+      allow read:  if true;
+      allow write: if isOwner(userId)
+        && request.resource.size < 10 * 1024 * 1024
+        && isImage();
+      allow delete: if isOwner(userId);
+    }
+
+    // ─── DENY everything else ───────────────────────────────────────
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

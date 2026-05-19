@@ -1,0 +1,528 @@
+rules_version = '2';
+
+/**
+ * Maawa Firestore Security Rules.
+ *
+ * Threat model assumptions:
+ *   • Browser is hostile. Anything writable from the browser must be
+ *     range-validated, schema-validated, and size-bounded.
+ *   • The Admin SDK (server) bypasses all rules — privileged mutations
+ *     (state transitions, balance changes, role grants, audit writes)
+ *     happen there.
+ *   • Tokens contain a `admin` custom claim set by /api/admin/users/promote.
+ *
+ * Convention:
+ *   isSignedIn()     — caller has a Firebase Auth ID token
+ *   isOwner(uid)     — caller's uid matches a document field/path
+ *   isAdmin()        — caller's token carries admin: true
+ *   onlyFieldsChanged(allowed) — diff vs old doc shows only `allowed` keys mutated
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helpers ────────────────────────────────────────────────────
+    function isSignedIn()       { return request.auth != null; }
+    function isOwner(uid)       { return isSignedIn() && request.auth.uid == uid; }
+    function isAdmin()          { return isSignedIn() && request.auth.token.admin == true; }
+
+    // True iff `request.resource.data` differs from `resource.data` ONLY
+    // in fields that are members of `allowed`. Used to permit users to
+    // edit their own profile EXCEPT privileged fields.
+    function diffKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+    function onlyAllowed(allowed) {
+      return diffKeys().hasOnly(allowed);
+    }
+
+    // Reasonable max document size (10 KB worth of typical content).
+    function smallDoc() { return request.resource.data.size() < 50; }
+
+    // ─── /users/{userId} ────────────────────────────────────────────
+    // A user can read their own profile and create the initial doc on
+    // sign-up. Anything that affects role/verification/balance/banning
+    // is server-only (Admin SDK).
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+
+      // Initial profile creation — only the user themselves, only with
+      // role:'client', no admin/verified/balance fields allowed.
+      allow create: if isOwner(userId)
+        && request.resource.data.keys().hasOnly([
+             'displayName', 'firstName', 'lastName', 'email', 'phone',
+             'wilaya', 'role', 'createdAt', 'updatedAt',
+           ])
+        && request.resource.data.role == 'client';
+
+      // Profile self-update — user can change a strict whitelist.
+      // role / verified / banned / maawaCoinBalance / payableBalance /
+      // adminRole / isAdmin are NOT in the whitelist, so changing them
+      // from a browser is denied. Server uses Admin SDK to bypass.
+      //
+      // The artisan-only fields (trade / experience / hourlyRate /
+      // serviceAreas) are allowed for any user here; the
+      // /api/me/artisan-profile route gates the artisan-role check
+      // server-side. The rule's whitelist still defends against
+      // someone trying to change `role` or financial fields.
+      allow update: if isOwner(userId)
+        && onlyAllowed([
+             'displayName', 'firstName', 'lastName', 'wilaya', 'bio',
+             'trade', 'experience', 'hourlyRate', 'serviceAreas',
+             'available', 'avatarUrl', 'updatedAt',
+           ]);
+
+      allow delete: if false;  // Account deletion requires Admin SDK.
+    }
+
+    // ─── /users/{userId}/push_tokens/{token} ────────────────────────
+    // FCM device tokens. The owner registers their own; admin reads
+    // for fan-out at send time via Admin SDK. We deliberately permit
+    // client-side writes here so the on-page registration round-trip
+    // works through the API route (Admin SDK on the server is the
+    // canonical writer; client direct-write only as a fallback).
+    match /users/{userId}/push_tokens/{token} {
+      allow read:   if isOwner(userId) || isAdmin();
+      allow create, update: if isOwner(userId)
+        && request.resource.data.keys().hasOnly(['token', 'userAgent', 'lastSeenAt']);
+      allow delete: if isOwner(userId);
+    }
+
+    // ─── /missions/{missionId} ──────────────────────────────────────
+    // Clients create their own missions, both parties can read.
+    // Status transitions and money fields are server-side only.
+    match /missions/{missionId} {
+      allow read: if isAdmin()
+        || (isSignedIn() && (resource.data.clientId == request.auth.uid
+                             || resource.data.artisanId == request.auth.uid));
+
+      allow create: if isSignedIn()
+        && request.resource.data.clientId == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+             'clientId', 'service', 'description', 'wilaya', 'address',
+             'budget', 'amount', 'urgency', 'photos', 'status', 'createdAt',
+           ])
+        && request.resource.data.status == 'pending'
+        && request.resource.data.amount is int
+        && request.resource.data.amount >= 0
+        && request.resource.data.amount <= 10000000;
+
+      // Updates from clients/artisans are restricted to non-financial,
+      // non-state fields. State machine moves go through API routes.
+      allow update: if isSignedIn()
+        && (resource.data.clientId == request.auth.uid
+            || resource.data.artisanId == request.auth.uid)
+        && onlyAllowed([
+             'description', 'photos', 'address', 'updatedAt',
+             // Limited client-side ratings:
+             'clientRating', 'clientReview', 'artisanRating', 'artisanReview',
+           ]);
+
+      allow delete: if false;
+    }
+
+    // ─── /missions/{id}/declines/{artisanUid} ───────────────────────
+    // Records that this artisan declined the offer. Server-only write
+    // via /api/artisan/mission/decline; read by the artisan themselves
+    // (so the UI can hide already-declined missions) and admins.
+    match /missions/{missionId}/declines/{artisanUid} {
+      allow read: if isAdmin()
+        || (isSignedIn() && request.auth.uid == artisanUid);
+      allow write: if false;  // Admin SDK only
+    }
+
+    // ─── /transactions/{txId} ───────────────────────────────────────
+    // Read-only for the owner; writes only via Admin SDK.
+    match /transactions/{txId} {
+      allow read: if isAdmin()
+        || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow write: if false;
+    }
+
+    // ─── /chats/{chatId} ────────────────────────────────────────────
+    // A chat between two users (or one user + Maawa Support — the
+    // peer id '_maawa_support' is a constant; no real user has that
+    // UID and admins read those threads via /admin/support).
+    match /chats/{chatId} {
+      // Read: must be a real participant, OR an admin reading a
+      // support thread (admins handle the Maawa Support side).
+      allow read: if isSignedIn() && (
+        (request.auth.uid in resource.data.participants)
+        || (isAdmin() && resource.data.isSupport == true)
+      );
+
+      // Create: caller must be in `participants`. We allow EITHER
+      //  - a 2-real-user chat (size==2, caller in it), OR
+      //  - a support chat: caller + '_maawa_support', `isSupport: true`
+      //    (created by /api/me/register-profile via Admin SDK, but the
+      //    rule still has to allow client-side creates for the manual
+      //    "open chat" flow on Explore in case it gets wired later).
+      allow create: if isSignedIn()
+        && request.auth.uid in request.resource.data.participants
+        && (
+          (request.resource.data.participants.size() == 2
+            && !('isSupport' in request.resource.data))
+          ||
+          (request.resource.data.participants.size() == 2
+            && request.resource.data.isSupport == true
+            && '_maawa_support' in request.resource.data.participants)
+        );
+
+      // Update: participants can write lastMessage / lastMessageAt /
+      // unread / updatedAt / typing — that's everything the messenger
+      // touches. Admins can also write into support threads when they
+      // reply via /api/admin/chat/reply (uses Admin SDK; rule allows
+      // browser-side too for parity).
+      allow update: if isSignedIn() && (
+        (request.auth.uid in resource.data.participants)
+        || (isAdmin() && resource.data.isSupport == true)
+      ) && onlyAllowed([
+        'lastMessage', 'lastMessageAt', 'unread', 'updatedAt',
+        'typing', 'typingAt',
+      ]);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        // Read: any participant OR an admin on a support thread.
+        allow read: if isSignedIn() && (
+          (request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants)
+          || (isAdmin()
+              && get(/databases/$(database)/documents/chats/$(chatId)).data.isSupport == true)
+        );
+
+        // Create: only by a participant, and senderId must be self.
+        // (Admin-as-support replies go through the Admin SDK and
+        // bypass these rules — they set senderId='_maawa_support'.)
+        allow create: if isSignedIn()
+          && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 2000;
+
+        // Update: only to append the caller's uid into the readBy
+        // array. We can't validate "exactly one new element" in
+        // Firestore rules without a hasOnly+size dance, so we keep
+        // it light: caller is a participant + only readBy / readAt
+        // fields touched.
+        allow update: if isSignedIn()
+          && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
+          && onlyAllowed(['readBy', 'readAt']);
+
+        allow delete: if false;
+      }
+    }
+
+    // ─── /notifications/{notifId} ───────────────────────────────────
+    match /notifications/{notifId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      // Allow marking-as-read and ONLY that.
+      allow update: if isSignedIn()
+        && resource.data.userId == request.auth.uid
+        && onlyAllowed(['unread', 'readAt']);
+      allow create, delete: if false;
+    }
+
+    // ─── /feed_posts/{postId} ───────────────────────────────────────
+    // Public read — guests can browse the feed (Phase 6 guest mode).
+    // Writes (create / update / delete) still require auth + ownership.
+    // The `sponsored` flag is server-only via /api/admin/content/sponsor.
+    match /feed_posts/{postId} {
+      allow read: if true;
+      allow create: if isSignedIn()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.text is string
+        && request.resource.data.text.size() <= 5000
+        && (!('likes' in request.resource.data) || request.resource.data.likes == 0)
+        /* `sponsored` is admin-set only — refuse client-side init. */
+        && (!('sponsored' in request.resource.data) || request.resource.data.sponsored == false);
+      allow update: if isSignedIn()
+        && resource.data.authorId == request.auth.uid
+        && onlyAllowed(['text', 'photos', 'category', 'updatedAt']);
+      // Permit a SINGLE-FIELD increment to `likes` from any signed-in
+      // user (so the like button works without a server round-trip).
+      // This is the only path by which `likes` can change client-side.
+      allow update: if isSignedIn()
+        && diffKeys().hasOnly(['likes'])
+        && request.resource.data.likes == resource.data.likes + 1;
+      // Same shape for commentsCount — incremented by the API when a
+      // new comment is created (server uses Admin SDK, but the rule
+      // also accepts a +1 from a participant in case we ever move
+      // creation client-side).
+      allow update: if isSignedIn()
+        && diffKeys().hasOnly(['commentsCount'])
+        && request.resource.data.commentsCount == resource.data.commentsCount + 1;
+      allow delete: if isSignedIn() && resource.data.authorId == request.auth.uid;
+
+      // ─── Comments sub-collection ──────────────────────────────────
+      // Public read (anyone can browse), authenticated write. Authors
+      // can edit (text only) and delete their own; the parent post's
+      // author can also delete comments on their post for moderation.
+      match /comments/{commentId} {
+        allow read: if true;
+        allow create: if isSignedIn()
+          && request.resource.data.authorId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 1000
+          && request.resource.data.keys().hasOnly([
+               'authorId', 'authorName', 'text', 'createdAt',
+             ]);
+        allow update: if isSignedIn()
+          && resource.data.authorId == request.auth.uid
+          && onlyAllowed(['text', 'updatedAt']);
+        allow delete: if isSignedIn() && (
+          resource.data.authorId == request.auth.uid
+          || get(/databases/$(database)/documents/feed_posts/$(postId)).data.authorId == request.auth.uid
+          || isAdmin()
+        );
+      }
+    }
+
+    // ─── /quotes/{quoteId} ──────────────────────────────────────────
+    match /quotes/{quoteId} {
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.description.size() <= 2000;
+      allow read: if isAdmin()
+        || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow update, delete: if false;
+    }
+
+    // ─── /applications/{appId} ──────────────────────────────────────
+    match /applications/{appId} {
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow read: if isAdmin()
+        || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow update, delete: if false;  // Server-only review.
+    }
+
+    // ─── /saved/{saveId} ────────────────────────────────────────────
+    match /saved/{saveId} {
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow read, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow update: if false;
+    }
+
+    // ─── /audit_logs/{logId} ────────────────────────────────────────
+    // Append-only via Admin SDK only. Admins can read; nobody can write.
+    match /audit_logs/{logId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ─── /broadcasts/{broadcastId} — Admin sends notifications ──────
+    match /broadcasts/{broadcastId} {
+      allow read: if isAdmin();
+      allow write: if false;  // Admin SDK only
+    }
+
+    // ─── /categories/{categoryId} — public catalog ──────────────────
+    match /categories/{categoryId} {
+      allow read: if true;     // public — categories are not sensitive
+      allow write: if false;   // Admin SDK only
+    }
+
+    // ─── /coin_purchase_requests/{id} ───────────────────────────────
+    // Users submit "demandes de recharge" — admin reviews and credits
+    // coins manually (Phase 3 spec). Once created, the doc is immutable
+    // from the browser: only the Admin SDK can flip status/reviewer
+    // metadata, so users can't approve their own request.
+    //
+    // Schema enforced here (browser-side); the server schema in
+    // /api/wallet/purchase-request is the same plus a Storage proof check.
+    match /coin_purchase_requests/{id} {
+      // Create — only by the requester themselves, with status:'pending'
+      // and amountMC clamped to the documented range.
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.amountMC is int
+        && request.resource.data.amountMC >= 100
+        && request.resource.data.amountMC <= 10000
+        && request.resource.data.amountDZD is int
+        && request.resource.data.paymentMethod in ['ccp', 'baridimob', 'cash_office']
+        && request.resource.data.keys().hasOnly([
+             'userId', 'amountMC', 'amountDZD', 'paymentMethod',
+             'proofUrl', 'reference', 'status',
+             'createdAt', 'reviewedAt', 'reviewedBy', 'reviewNote',
+           ]);
+
+      // Read — only the requester or an admin.
+      allow read: if isAdmin()
+        || (isSignedIn() && resource.data.userId == request.auth.uid);
+
+      // No browser-side mutation — review goes through the Admin SDK.
+      allow update, delete: if false;
+    }
+
+    // ─── /stories/{id} ──────────────────────────────────────────────
+    // 24h-expiring stories. Public read by design — guests can view
+    // them without an account (matches the brief's "Guest mode on
+    // stories" requirement). Filtering by `expiresAt > now` is the
+    // client's job; expired docs are swept by a future Cloud Function.
+    //
+    // The view counter lives on the doc but is written ONLY via
+    // /api/stories/view (the rule below denies all browser updates).
+    match /stories/{id} {
+      allow read:   if true;  // public — guests + signed-in
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+             'userId', 'kind', 'mediaUrl', 'text', 'gradient',
+             'createdAt', 'expiresAt', 'views',
+           ])
+        && request.resource.data.views == 0
+        && (
+          (request.resource.data.kind == 'text'
+            && request.resource.data.text is string
+            && request.resource.data.text.size() <= 200
+            && request.resource.data.text.size() > 0
+            && request.resource.data.gradient is int
+            && request.resource.data.gradient >= 0
+            && request.resource.data.gradient <= 4)
+          ||
+          (request.resource.data.kind == 'photo'
+            && request.resource.data.mediaUrl is string)
+        );
+      // No browser-side updates — view counter is server-only.
+      allow update: if false;
+      // Authors can delete their own story (e.g. retract early).
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // ─── /stories/{id}/viewers/{viewerUid} ──────────────────────────
+    // Tracks which signed-in users have already viewed a given story
+    // so /api/stories/view stays idempotent. Server-only write; the
+    // owner of the story (and admins) can read for analytics.
+    match /stories/{id}/viewers/{viewerUid} {
+      allow read:   if isAdmin()
+        || (isSignedIn() && get(/databases/$(database)/documents/stories/$(id)).data.userId == request.auth.uid);
+      allow write:  if false;  // Admin SDK only via /api/stories/view
+    }
+
+    // ─── /follows/{id} ──────────────────────────────────────────────
+    // One doc per (follower, following) pair. Doc id is the composite
+    // `{followerId}_{followingId}` for natural uniqueness — re-following
+    // is an idempotent `set` of the same id rather than a duplicate row.
+    // Reads are public so anyone can see follower / following lists
+    // (matches Twitter/Instagram norms; counters are aggregations).
+    match /follows/{id} {
+      allow read: if true;
+      allow create: if isSignedIn()
+        && request.resource.data.followerId == request.auth.uid
+        && request.resource.data.followerId != request.resource.data.followingId
+        && request.resource.data.keys().hasOnly(['followerId', 'followingId', 'createdAt']);
+      allow delete: if isSignedIn() && resource.data.followerId == request.auth.uid;
+      allow update: if false;
+    }
+
+    // ─── /reports/{id} ──────────────────────────────────────────────
+    // User-submitted abuse reports. Reporter can read their own
+    // (so they can see resolution status); admins can read all.
+    // No browser-side update — resolution goes through the API.
+    match /reports/{id} {
+      allow create: if isSignedIn()
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.keys().hasOnly([
+             'reporterId', 'targetKind', 'targetId', 'parentId',
+             'reason', 'note', 'status', 'createdAt',
+           ])
+        && request.resource.data.targetKind in ['user', 'post', 'reel', 'story', 'ad', 'comment']
+        && request.resource.data.reason in ['spam', 'harassment', 'fake', 'inappropriate', 'fraud', 'other']
+        && (request.resource.data.targetKind != 'comment'
+            || (request.resource.data.parentId is string && request.resource.data.parentId.size() > 0))
+        && (!('note' in request.resource.data)
+            || request.resource.data.note == null
+            || (request.resource.data.note is string && request.resource.data.note.size() <= 500));
+      allow read: if isAdmin()
+        || (isSignedIn() && resource.data.reporterId == request.auth.uid);
+      allow update, delete: if false;
+    }
+
+    // ─── /ratings/{id} ──────────────────────────────────────────────
+    // One rating per (mission, rater) pair. Public read so artisan
+    // pages can show recent reviews. Server-only write — the API
+    // route enforces that the rater participated in the mission and
+    // recomputes the ratee's avg in the same transaction.
+    match /ratings/{id} {
+      allow read: if true;
+      allow create, update, delete: if false;
+    }
+
+    // ─── /payout_requests/{id} ──────────────────────────────────────
+    // Artisan submits a withdrawal request; admin approves/rejects.
+    // Owner can read their own; admin reads all. Server-only writes
+    // (debits + status flips need transactional Admin SDK).
+    match /payout_requests/{id} {
+      allow read: if isAdmin()
+        || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create, update, delete: if false;
+    }
+
+    // ─── /categories/{id} ───────────────────────────────────────────
+    // Service categories shown in /apply + /explore + /quote. Public
+    // read (the dropdowns need to render for guests). Server-only
+    // writes via /api/admin/categories/* — admin SDK bypasses rules
+    // and enforces its own auth check.
+    match /categories/{id} {
+      allow read: if true;
+      allow create, update, delete: if false;
+    }
+
+    // ─── /disputes/{id} ─────────────────────────────────────────────
+    // Mission disputes. Either participant can create + read their
+    // own; admin reads all; only admin moves state forward.
+    match /disputes/{id} {
+      allow create: if isSignedIn()
+        && request.resource.data.openedBy == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.keys().hasOnly([
+             'missionId', 'openedBy', 'againstUid', 'reason',
+             'note', 'status', 'createdAt',
+           ])
+        && request.resource.data.reason in [
+             'no_show', 'incomplete_work', 'damage', 'overcharge',
+             'unsafe', 'payment_issue', 'other',
+           ];
+      allow read: if isAdmin()
+        || (isSignedIn() && (
+             resource.data.openedBy   == request.auth.uid
+          || resource.data.againstUid == request.auth.uid
+          ));
+      allow update, delete: if false;
+    }
+
+    // ─── /platform_settings/{id} ────────────────────────────────────
+    // Singleton config doc (id='global'). Public read so client code
+    // can pick up overrides without a server round-trip; server-only
+    // writes via /api/admin/settings/update.
+    match /platform_settings/{id} {
+      allow read: if true;
+      allow create, update, delete: if false;
+    }
+
+    // ─── /broadcasts/{id} ───────────────────────────────────────────
+    // Admin-initiated mass notifications. Audited; the fan-out into
+    // /notifications is best-effort and may be partial on failure.
+    match /broadcasts/{id} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // ─── /ads/{id} ──────────────────────────────────────────────────
+    // Admin-curated promo cards (no targeting/budget yet — see
+    // /admin/ads page). Public read so the platform can render them;
+    // server-only writes.
+    match /ads/{id} {
+      allow read: if true;
+      allow create, update, delete: if false;
+    }
+
+    // ─── Default deny ───────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

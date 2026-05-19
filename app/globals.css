@@ -1,0 +1,26 @@
+/* ════════════════════════════════════════════════════════════════
+   MAAWA — Root globals
+   The bulk of styles live in app/platform.css and app/admin.css,
+   each scoped to body.maawa-platform / body.maawa-admin via native
+   CSS nesting so the two prototype stylesheets cannot collide.
+   ════════════════════════════════════════════════════════════════ */
+
+/* Box-sizing reset that both prototypes rely on */
+*, *::before, *::after { box-sizing: border-box; }
+
+/* Both prototypes set these on body */
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Default font family — overridden inside each scoped stylesheet */
+body {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+}
