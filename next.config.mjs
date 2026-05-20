@@ -25,7 +25,7 @@ const isDev = process.env.NODE_ENV === 'development';
 
 const csp = [
   "default-src 'self'",
-  `script-src 'self' 'unsafe-eval' ${isDev ? "'unsafe-inline'" : ""} https://www.gstatic.com https://www.google.com https://apis.google.com https://maps.googleapis.com https://*.sentry-cdn.com`,
+  "script-src 'self' 'unsafe-eval' 'unsafe-inline' https://www.gstatic.com https://www.google.com https://apis.google.com https://maps.googleapis.com https://*.sentry-cdn.com",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "img-src 'self' data: blob: https: http:",
   "font-src 'self' data: https://fonts.gstatic.com",
