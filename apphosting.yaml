@@ -1,0 +1,35 @@
+# apphosting.yaml
+# Firebase App Hosting configuration
+# Documentation: https://firebase.google.com/docs/app-hosting/configure
+
+headers: []
+
+env:
+  - variable: NEXT_PUBLIC_FIREBASE_PROJECT_ID
+    value: maawa-baa09
+  - variable: NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET
+    value: maawa-baa09.appspot.com
+  - variable: FIREBASE_ADMIN_PROJECT_ID
+    value: maawa-baa09
+  - variable: FIREBASE_ADMIN_CLIENT_EMAIL
+    value: firebase-adminsdk-fbsvc@maawa-baa09.iam.gserviceaccount.com
+  - variable: NEXT_PUBLIC_MC_RATE_DZD
+    value: "50"
+  - variable: PLATFORM_COMMISSION_RATE
+    value: "0.10"
+  - variable: NEXT_PUBLIC_SUPPORT_PHONE
+    value: "+213233000000"
+  
+  # Secrets (referenced from Google Cloud Secret Manager for security)
+  - variable: FIREBASE_ADMIN_PRIVATE_KEY
+    secret: FIREBASE_ADMIN_PRIVATE_KEY
+  - variable: NEXTAUTH_SECRET
+    secret: NEXTAUTH_SECRET
+  - variable: NEXT_PUBLIC_FIREBASE_API_KEY
+    secret: NEXT_PUBLIC_FIREBASE_API_KEY
+  - variable: NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN
+    secret: NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN
+  - variable: NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID
+    secret: NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID
+  - variable: NEXT_PUBLIC_FIREBASE_APP_ID
+    secret: NEXT_PUBLIC_FIREBASE_APP_ID
